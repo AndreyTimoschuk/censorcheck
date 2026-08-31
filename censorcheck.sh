@@ -15,8 +15,27 @@ PROXY=""
 VERBOSE=false
 DEBUG=false
 
-RIPE_API_KEY="4bf07def-dcf4-4fc9-8097-3735f45bd0ed" # Не берите ключ, пожалуйста, можете создать свой на atlas.ripe, это не сложно
+# Ключ RIPE Atlas. Берется из --key, иначе из окружения, иначе спрашивается.
+# Свой ключ: https://atlas.ripe.net/keys/ (право "Schedule a new measurement")
+RIPE_API_KEY="2bcdeedb-9dc6-49a8-b253-90f838f0a5fa"
 REALITY_SNI="max.ru"
+NO_PROMPT=false
+
+usage() {
+  cat <<'USAGE'
+censorcheck.sh [опции]
+
+  -v, --verbose        подробный вывод по доменам
+  -d, --debug          debug-лог радара RIPE Atlas
+  -k, --key <uuid>     ключ RIPE Atlas (или переменная окружения RIPE_API_KEY)
+      --no-prompt      не спрашивать ключ интерактивно
+  -h, --help           эта справка
+
+Ключ создается за минуту на https://atlas.ripe.net/keys/ — нужно ровно одно
+право, "Schedule a new measurement". Без ключа отрабатывает только проверка
+доменов, радар ТСПУ пропускается.
+USAGE
+}
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -28,11 +47,38 @@ while [[ $# -gt 0 ]]; do
       DEBUG=true
       shift
       ;;
+    -k|--key)
+      RIPE_API_KEY="$2"
+      shift 2
+      ;;
+    --no-prompt)
+      NO_PROMPT=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
     *)
       shift
       ;;
   esac
 done
+
+# "Insert the key" — плейсхолдер из старых версий. Для нас он равносилен
+# пустому: он непустой, поэтому раньше проходил проверку и ловил 401.
+[[ "$RIPE_API_KEY" == "Insert the key" ]] && RIPE_API_KEY=""
+
+# Ключ спрашиваем через fd 9 на /dev/tty, а не со stdin: скрипт часто
+# запускают как `curl ... | bash`, и stdin занят самим скриптом.
+if [[ -z "$RIPE_API_KEY" && "$NO_PROMPT" == false ]]; then
+  { exec 9<>/dev/tty; } 2>/dev/null
+  if [[ -e /dev/fd/9 ]]; then
+    printf 'Ключ RIPE Atlas (Enter — пропустить радар): ' >&9
+    read -r RIPE_API_KEY <&9 || RIPE_API_KEY=""
+    exec 9>&-
+  fi
+fi
 
 DOMAINS=(
   "youtube.com"
@@ -535,19 +581,27 @@ if [[ -n "$CURRENT_ASN" ]]; then
 fi
 echo
 
-if [[ -n "$CURRENT_IP" ]] && [[ -n "$RIPE_API_KEY" ]]; then
+if [[ -n "$CURRENT_IP" ]]; then
   echo "$LINE_SEP"
-  
+
+  if [[ -z "$RIPE_API_KEY" ]]; then
+    echo -e "${YELLOW}Радар ТСПУ пропущен: не задан ключ RIPE Atlas.${RESET}"
+    echo -e "${DIM}Создать: https://atlas.ripe.net/keys/ (право Schedule a new measurement)${RESET}"
+    echo -e "${DIM}Затем: ./censorcheck.sh --key <uuid>   или   export RIPE_API_KEY=<uuid>${RESET}"
   # Чекер 443 порта, нужен для Atlas
-  if ! ss -tuln 2>/dev/null | grep -qE "(0\.0\.0\.0|\*|$CURRENT_IP):443\b"; then
+  elif ! ss -tuln 2>/dev/null | grep -qE "(0\.0\.0\.0|\*|$CURRENT_IP):443\b"; then
     echo -e "${DIM}Радар ТСПУ отменен. Для корректной проверки запустите VPN (Xray/3X-UI)${RESET}"
   else
     echo -e "Опрос сетей РФ: РТК, МТС, МГТС, Билайн, ТТК, РТК-Юг, Мегафон .."
     
     TMP_ATLAS=$(mktemp)
     TMP_ATLAS_DEBUG=$(mktemp)
-    python3 -c "
-import sys, json, time, urllib.request
+    # Программа передается через кавычечный heredoc во временный файл, а не
+    # через python3 -c "...": внутри двойных кавычек bash раскрывает $ и
+    # обратные кавычки и закрывает строку на первой же кавычке в исходнике.
+    TMP_PY=$(mktemp)
+    cat > "$TMP_PY" <<'PYEOF'
+import sys, json, time, urllib.request, urllib.error
 
 api_key = sys.argv[1]
 target_ip = sys.argv[2]
@@ -560,7 +614,35 @@ def dlog(msg):
 
 dlog(f'target_ip={target_ip} sni={sni}')
 
-url = 'https://atlas.ripe.net/api/v2/measurements/'
+BASE = 'https://atlas.ripe.net/api/v2'
+
+if not api_key or api_key == 'Insert the key':
+    print('ERROR NOKEY', flush=True)
+    sys.exit(0)
+
+# Преflight. 401 = ключ мертв, дальше идти незачем. 403 = у ключа просто нет
+# права читать баланс (такого права в дропдауне RIPE и нет) — это не ошибка.
+balance = None
+try:
+    req = urllib.request.Request(BASE + '/credits/',
+                                 headers={'Authorization': 'Key ' + api_key})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        balance = json.loads(r.read().decode()).get('current_balance')
+    dlog(f'credit balance={balance}')
+except urllib.error.HTTPError as e:
+    body = ''
+    try:
+        body = e.read().decode()[:300]
+    except Exception:
+        pass
+    if e.code == 401:
+        print('ERROR AUTH ' + body.replace(chr(10), ' '), flush=True)
+        sys.exit(0)
+    dlog(f'credits check HTTP {e.code} (не фатально): {body}')
+except Exception as e:
+    dlog(f'credits check failed: {type(e).__name__}: {e}')
+
+url = BASE + '/measurements/'
 data = {
     'definitions': [{
         'target': target_ip, 
@@ -587,16 +669,31 @@ data = {
     'is_oneoff': True
 }
 
-req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), 
-                             headers={'Content-Type': 'application/json', 'Authorization': f'Key {api_key}'})
+req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'),
+                             headers={'Content-Type': 'application/json',
+                                      'Authorization': 'Key ' + api_key})
 try:
-    with urllib.request.urlopen(req) as response:
-        resp_data = json.loads(response.read().decode())
-        msm_id = resp_data['measurements'][0]
+    with urllib.request.urlopen(req, timeout=30) as response:
+        msm_id = json.loads(response.read().decode())['measurements'][0]
         dlog(f'measurement_id={msm_id}')
+except urllib.error.HTTPError as e:
+    body = ''
+    try:
+        body = e.read().decode()[:400]
+    except Exception:
+        pass
+    dlog(f'create HTTP {e.code}: {body}')
+    one_line = body.replace(chr(10), ' ')
+    if e.code == 401:
+        print('ERROR AUTH ' + one_line, flush=True)
+    elif e.code == 403 and 'credit' in body.lower():
+        print('ERROR CREDITS ' + one_line, flush=True)
+    else:
+        print(f'ERROR CREATE {e.code} ' + one_line, flush=True)
+    sys.exit(0)
 except Exception as e:
-    dlog(f'API create error: {type(e).__name__}: {e}')
-    print('ERROR API_FAIL')
+    dlog(f'create error: {type(e).__name__}: {e}')
+    print('ERROR CREATE 0 ' + type(e).__name__, flush=True)
     sys.exit(0)
 
 results_url = f'https://atlas.ripe.net/api/v2/measurements/{msm_id}/results/'
@@ -625,7 +722,8 @@ if debug:
         dlog(f'  probe[{i}] prb_id={prb_id} asn={asn} keys={keys} err={err!r}')
 
 if not results:
-    print('ERROR NO_DATA')
+    print(f'ERROR NODATA {msm_id}', flush=True)
+    sys.exit(0)
     sys.exit(0)
 
 blocked = 0
@@ -661,7 +759,8 @@ if blocked_prb_ids:
 if blocked_asns:
     parts = ' '.join(f'{asn}:{cnt}' for asn, cnt in blocked_asns.items())
     print(f'BLOCKED_ASN {parts}')
-    " "$RIPE_API_KEY" "$CURRENT_IP" "$REALITY_SNI" "$DEBUG" > "$TMP_ATLAS" 2>"$TMP_ATLAS_DEBUG" &
+PYEOF
+    python3 "$TMP_PY" "$RIPE_API_KEY" "$CURRENT_IP" "$REALITY_SNI" "$DEBUG" > "$TMP_ATLAS" 2>"$TMP_ATLAS_DEBUG" &
     
     ATLAS_PID=$!
 
@@ -693,7 +792,7 @@ if blocked_asns:
     printf "\r${CYAN}Запуск радара ТСПУ${RESET}\e[K\n"
 
     ATLAS_RESULT=$(cat "$TMP_ATLAS")
-    rm -f "$TMP_ATLAS"
+    rm -f "$TMP_ATLAS" "$TMP_PY"
 
     FIRST_LINE=$(echo "$ATLAS_RESULT" | head -n1)
     BLOCKED_ASN_LINE=$(echo "$ATLAS_RESULT" | grep "^BLOCKED_ASN" | head -n1)
@@ -777,7 +876,35 @@ if blocked_asns:
       fi
 
     else
-      echo -e "${YELLOW}Не удалось получить данные, попробуйте позже${RESET}"
+      ERR_CODE=$(echo "$FIRST_LINE" | awk '{print $2}')
+      ERR_BODY=$(echo "$FIRST_LINE" | cut -d' ' -f3-)
+      case "$ERR_CODE" in
+        NOKEY)
+          echo -e "${YELLOW}Радар: ключ RIPE Atlas не задан.${RESET}"
+          echo -e "${DIM}https://atlas.ripe.net/keys/ → право Schedule a new measurement${RESET}"
+          ;;
+        AUTH)
+          echo -e "${RED}Радар: RIPE Atlas отверг ключ (401).${RESET}"
+          [[ -n "$ERR_BODY" ]] && echo -e "${DIM}${ERR_BODY}${RESET}"
+          ;;
+        CREDITS)
+          echo -e "${RED}Радар: не хватает кредитов RIPE Atlas.${RESET}"
+          [[ -n "$ERR_BODY" ]] && echo -e "${DIM}${ERR_BODY}${RESET}"
+          echo -e "${DIM}Кредиты начисляются за хостинг зонда: https://atlas.ripe.net/apply/${RESET}"
+          ;;
+        CREATE)
+          echo -e "${RED}Радар: RIPE Atlas отклонил измерение.${RESET}"
+          [[ -n "$ERR_BODY" ]] && echo -e "${DIM}${ERR_BODY}${RESET}"
+          ;;
+        NODATA)
+          echo -e "${YELLOW}Радар: зонды не успели ответить.${RESET}"
+          echo -e "${DIM}Измерение создано, результаты придут позже:${RESET}"
+          echo -e "${DIM}  https://atlas.ripe.net/measurements/${ERR_BODY}/${RESET}"
+          ;;
+        *)
+          echo -e "${YELLOW}Не удалось получить данные, попробуйте позже${RESET}"
+          ;;
+      esac
     fi
 
     if $DEBUG && [[ -s "$TMP_ATLAS_DEBUG" ]]; then
