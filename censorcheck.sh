@@ -15,7 +15,7 @@ PROXY=""
 VERBOSE=false
 DEBUG=false
 
-RIPE_API_KEY="Insert the key" # Не берите ключ, пожалуйста, можете создать свой на atlas.ripe, это не сложно
+RIPE_API_KEY="5a5edf32-179b-4783-b2a4-e96b0506ce36" # Не берите ключ, пожалуйста, можете создать свой на atlas.ripe, это не сложно
 REALITY_SNI="max.ru"
 
 while [[ $# -gt 0 ]]; do
