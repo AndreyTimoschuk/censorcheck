@@ -37,14 +37,7 @@
 3. Важно понимать, что блокировки часто бывают региональными, зонд, зафиксировавший блокировку, мог находиться в городе, где ТСПУ уже жестко фильтрует ваш IP. А до вашего региона эти фильтры просто ещё не дошли.
 
 ## 🚀 Запуск
-
-### 🌐 Короткая ссылка
-```bash
-wget -qO- censorcheck.tlab.pw | bash
-```
-
 ---
-
 ### 🔧 Запуск (с GitHub)
 ```bash
 wget -qO- https://raw.githubusercontent.com/AndreyTimoschuk/censorcheck/main/censorcheck.sh | bash
